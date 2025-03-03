@@ -1,0 +1,618 @@
+---
+title: "Heliocentric/ Smart Decision Model"
+author: "Brian Papiernik"
+date: "2024-10-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+```
+
+
+```{r}
+#Set the working directory
+setwd("C:/Users/npowers/Documents/Notre Dame MSSA/CourtViz/CV/Shot and Distance")
+
+csv_files <- list.files(pattern = "\\.csv$")
+
+shots <- data.frame()
+
+for (file in csv_files){
+  
+  temp_data <- read.csv(file)
+  shots <- rbind(shots, temp_data)
+}
+
+summary(shots)
+```
+
+```{r}
+#write.csv(shots, "shots.csv")
+```
+
+```{r}
+#shots <- read.csv("shots.csv")
+```
+
+
+```{r}
+shots2 <- shots %>%
+  filter(!is.na(defender_distance) & y <= 470 & defender_distance <= 20 & dribbles <= 4)
+
+
+```
+
+
+
+```{r}
+# Load the ggplot2 library
+library(ggplot2)
+
+# Create a scatter plot using ggplot
+ggplot(shots2, aes(x = x, y = y, color = factor(shot_made_flag))) +
+  geom_point() +
+  labs(title = "Scatter Plot of X vs Y", x = "X Axis Label", y = "Y Axis Label") +
+  theme_minimal()
+
+```
+
+```{r}
+# Step 1: Shift the Y-coordinates so -51 becomes 0 (you might have done this already)
+shots3 <- shots2 %>%
+  mutate(
+    adjusted_y = y + 51  # Shifting Y so -51 becomes 0
+  )
+
+# Step 2: Create 25x25 square foot zones for X and Y
+# Divide X into 20 zones (since X goes from -250 to 250)
+x_breaks <- seq(-250, 250, by = 25)  # X zones: 20 zones, each 25 feet wide
+# Divide Y into 19 zones (since Y goes from 0 to 470)
+y_breaks <- seq(0, 521, by = 25)     # Y zones: 19 zones, each 25 feet tall
+
+# Step 3: Assign X and Y zones to each shot and combine them into a single zone label
+shots3 <- shots3 %>%
+  mutate(
+    x_zone = cut(x, breaks = x_breaks, labels = FALSE, include.lowest = TRUE),
+    y_zone = cut(adjusted_y, breaks = y_breaks, labels = FALSE, include.lowest = TRUE),
+    y_zone = ifelse(is.na(y_zone), 21, y_zone),  # If y_zone is NA, make it 21
+    court_zone = paste(x_zone, y_zone, sep = "0")  # Create a combined zone label
+  )
+
+# Step 4: Visualize the shots colored by their zones
+ggplot(shots3, aes(x = x, y = adjusted_y, color = court_zone)) +
+  geom_point() +  # Set points to a single color
+  geom_vline(xintercept = seq(-250, 250, by = 25), color = "black", linetype = "dashed") +  # Vertical grid lines for X zones
+  geom_hline(yintercept = seq(0, 470, by = 25), color = "black", linetype = "dashed") +    # Horizontal grid lines for Y zones
+  labs(title = "Scatter Plot with 25x25 Zone Outlines", 
+       x = "Court X Coordinates", 
+       y = "Court Y Coordinates") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+length(unique(shots3$court_zone))
+summary(shots3)
+```
+
+```{r}
+
+shots3 <- shots3 %>%
+  mutate(court_zone = as.numeric(court_zone),
+  points = ifelse(shot_type == "3PT Field Goal", shot_made_flag * 3,
+                         ifelse(shot_type == "2PT Field Goal", shot_made_flag * 2, 0)))
+
+final_shots <- shots3 %>%
+  select(court_zone, shot_distance, defender_distance, points, shot_made_flag)
+
+mean_shot_made_by_zone <- final_shots %>%
+  group_by(court_zone) %>%
+  summarise(mean_shot_made = mean(shot_made_flag),
+            expected_points = mean(points),
+            count_shot =n())
+
+```
+
+# Expected Points XGBoost Model
+
+```{r}
+library(randomForest) # Load randomForest package to run bagging
+library(rpart) # Load rpart for decision trees
+library(caret)
+library(splitstackshape)
+library(devtools)
+library(xgboost) # Load XGBoost
+library(caret) # Load Caret
+library(pROC) # Load proc
+library(SHAPforxgboost) # Load shap for XGBoost
+library(caTools)
+library(GGally)
+library(pROC) # Load proc
+library(data.table)
+library(gh)
+library(commonmark)
+library(xgboostExplainer)
+```
+
+
+```{r}
+set.seed(246801)
+sample <- sample.split(final_shots$points, SplitRatio = 0.8)
+shot_train  <- subset(final_shots, sample == TRUE)
+shot_test <- subset(final_shots, sample == FALSE)
+dim(shot_train)
+dim(shot_test)
+head(shot_train)
+```
+
+```{r}
+dtrain <- xgb.DMatrix(data = as.matrix(shot_train[,c(1:3)]), label = as.numeric(shot_train$points))
+
+# Create test matrix
+
+dtest <-  xgb.DMatrix(data = as.matrix(shot_test[,c(1:3)]), label = as.numeric(shot_test$points))
+```
+
+
+```{r}
+set.seed(111111)
+bst_1 <- xgboost(data = dtrain, # Set training data
+               
+               nrounds = 100, # Set number of rounds
+               
+               verbose = 1, # 1 - Prints out fit
+                print_every_n = 20) # Prints out result every 20th iteration
+```
+
+```{r}
+set.seed(111111)
+bst <- xgb.cv(data = dtrain, # Set training data
+              
+              nfold = 5, # Use 5 fold cross-validation
+               
+               eta = 0.1, # Set learning rate
+              
+               nrounds = 1000, # Set number of rounds
+               early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+               
+               verbose = 1, # 1 - Prints out fit
+               nthread = 1, # Set number of parallel threads
+               print_every_n = 20) # Prints out result every 20th iteration
+```
+
+
+```{r}
+max_depth_vals <- c(3, 5, 7, 10, 15) # Create vector of max depth values
+min_child_weight <- c(1,3,5,7, 10, 15) # Create vector of min child values
+
+# Expand grid of parameter values
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+# Create results vector
+rmse_vec  <- rep(NA, nrow(cv_params)) 
+# Loop through results
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = cv_params$max_depth[i], # Set max depth
+                     min_child_weight = cv_params$min_child_weight[i], # Set minimum number of samples in node to split
+                     
+                     
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+                     
+  ) # Set evaluation metric to use
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+
+beepr::beep()
+```
+
+
+
+```{r}
+# Join results in dataset
+res_db <- cbind.data.frame(cv_params, rmse_vec)
+names(res_db)[3] <- c("rmse") 
+res_db$max_depth <- as.factor(res_db$max_depth) # Convert tree number to factor for plotting
+res_db$min_child_weight <- as.factor(res_db$min_child_weight) # Convert node size to factor for plotting
+# Print AUC heatmap
+g_2 <- ggplot(res_db, aes(y = max_depth, x = min_child_weight, fill = rmse)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =mean(res_db$rmse), # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Minimum Child Weight", y = "Max Depth", fill = "RMSE") # Set labels
+g_2 # Generate plot
+```
+
+
+```{r}
+res_db[which.min(res_db$rmse),] 
+```
+
+```{r}
+gamma_vals <- c(0, 0.05, 0.1, 0.15, 0.2) # Create vector of gamma values
+
+# Be Careful - This can take a very long time to run
+set.seed(111111)
+rmse_vec  <- rep(NA, length(gamma_vals))
+for(i in 1:length(gamma_vals)){
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = 5, # Set max depth
+                     min_child_weight = 1, # Set minimum number of samples in node to split
+                     gamma = gamma_vals[i], # Set minimum loss reduction for split
+                     
+                     
+                     
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+  ) # Set evaluation metric to use
+  
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+
+beepr::beep()
+```
+
+
+```{r}
+cbind.data.frame(gamma_vals, rmse_vec)
+```
+
+```{r}
+###### 3 - Subsample and Column sample Tuning ######
+
+# Be Careful - This can take a very long time to run
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of subsample values
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of col sample values
+
+# Expand grid of tuning parameters
+cv_params <- expand.grid(subsample, colsample_by_tree)
+names(cv_params) <- c("subsample", "colsample_by_tree")
+# Create vectors to store results
+rmse_vec <- rep(NA, nrow(cv_params)) 
+# Loop through parameter values
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = 5, # Set max depth
+                     min_child_weight = 1, # Set minimum number of samples in node to split
+                     gamma = 0.2, # Set minimum loss reduction for split
+                     subsample = cv_params$subsample[i], # Set proportion of training data to use in tree
+                     colsample_bytree = cv_params$colsample_by_tree[i], # Set number of variables to use in each tree
+                     
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+  ) # Set evaluation metric to use
+  
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+
+beepr::beep()
+```
+
+
+
+165
+
+```{r}
+res_db <- cbind.data.frame(cv_params, rmse_vec)
+names(res_db)[3] <- c("rmse") 
+res_db$subsample <- as.factor(res_db$subsample) # Convert tree number to factor for plotting
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree) # Convert node size to factor for plotting
+g_4 <- ggplot(res_db, aes(y = colsample_by_tree, x = subsample, fill = rmse)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =mean(res_db$rmse), # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Subsample", y = "Column Sample by Tree", fill = "RMSE") # Set labels
+g_4 # Generate plot
+```
+
+
+```{r}
+res_db
+```
+
+
+```{r}
+res_db[which.min(res_db$rmse),]
+```
+
+```{r}
+###### 4 - eta tuning ######
+
+# Use xgb.cv to run cross-validation inside xgboost
+set.seed(111111)
+bst_mod_1 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.3, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 1, # Set minimum number of samples in node to split
+                    gamma = .2, # Set minimum loss reduction for split
+                    subsample = .9, # Set proportion of training data to use in tree
+                    colsample_bytree =  1, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+```
+
+
+```{r}
+set.seed(111111)
+bst_mod_2 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.1, # Set learning rate
+                    max.depth =  5, # Set max depth
+                    min_child_weight = 1, # Set minimum number of samples in node to split
+                    gamma = .2, # Set minimum loss reduction for split
+                    subsample = .9, # Set proportion of training data to use in tree
+                    colsample_bytree = 1, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+```
+
+
+```{r}
+set.seed(111111)
+bst_mod_3 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.05, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 1, # Set minimum number of samples in node to split
+                    gamma = .2, # Set minimum loss reduction for split
+                    subsample = .9 , # Set proportion of training data to use in tree
+                    colsample_bytree =  1, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+```
+
+
+
+```{r}
+set.seed(111111)
+bst_mod_4 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.01, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 1, # Set minimum number of samples in node to split
+                    gamma = 0.2, # Set minimum loss reduction for split
+                    subsample = .9, # Set proportion of training data to use in tree
+                    colsample_bytree = 1, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+```
+
+
+
+```{r}
+set.seed(111111)
+bst_mod_5 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.005, # Set learning rate
+                    max.depth = 5, # Set max depth
+                    min_child_weight = 1, # Set minimum number of samples in node to split
+                    gamma = .2, # Set minimum loss reduction for split
+                    subsample = .9 , # Set proportion of training data to use in tree
+                    colsample_bytree = 1, # Set number of variables to use in each tree
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+                    
+) # Set evaluation metric to use
+```
+
+```{r}
+# Extract results for model with eta = 0.3
+pd1 <- cbind.data.frame(bst_mod_1$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.3, nrow(bst_mod_1$evaluation_log)))
+names(pd1)[3] <- "eta"
+# Extract results for model with eta = 0.1
+pd2 <- cbind.data.frame(bst_mod_2$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.1, nrow(bst_mod_2$evaluation_log)))
+names(pd2)[3] <- "eta"
+# Extract results for model with eta = 0.05
+pd3 <- cbind.data.frame(bst_mod_3$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.05, nrow(bst_mod_3$evaluation_log)))
+names(pd3)[3] <- "eta"
+# Extract results for model with eta = 0.01
+pd4 <- cbind.data.frame(bst_mod_4$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.01, nrow(bst_mod_4$evaluation_log)))
+names(pd4)[3] <- "eta"
+# Extract results for model with eta = 0.005
+pd5 <- cbind.data.frame(bst_mod_5$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.005, nrow(bst_mod_5$evaluation_log)))
+names(pd5)[3] <- "eta"
+# Join datasets
+plot_data <- rbind.data.frame(pd1, pd2, pd3, pd4, pd5)
+# Converty ETA to factor
+plot_data$eta <- as.factor(plot_data$eta)
+# Plot points
+g_6 <- ggplot(plot_data, aes(x = iter, y = test_rmse_mean, color = eta))+
+  geom_point(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "RMSE v Number of Trees",
+       y = "RMSE", color = "Learning \n Rate")  # Set labels
+g_6
+```
+
+```{r}
+set.seed(111111)
+bst_final <- xgboost(data = dtrain, # Set training data
+                     
+                     
+                     
+                     eta = .01, # Set learning rate
+                     max.depth =  5, # Set max depth
+                     min_child_weight = 1, # Set minimum number of samples in node to split
+                     gamma = .2, # Set minimum loss reduction for split
+                     subsample = .9, # Set proportion of training data to use in tree
+                     colsample_bytree = 1, # Set number of variables to use in each tree
+                     
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+                     
+) # Set evaluation metric to use
+```
+
+```{r}
+# Extract importance
+imp_mat <- xgb.importance(model = bst_final)
+# Plot importance (top 10 variables)
+xgb.plot.importance(imp_mat, top_n = 10)
+```
+
+```{r}
+NBAfit1 <- lm(points ~ court_zone + shot_distance + defender_distance, data = final_shots)
+summary(NBAfit1)
+```
+
+```{r}
+final_shots2 <- final_shots[,c(1:3)]
+shot_snapshot <- as.matrix(final_shots2)
+# Step 3: Predict expected points for each player on the court
+predicted_ep <- predict(bst_final, newdata = shot_snapshot )
+
+# Step 4: Find the maximum expected points for other players on the court
+max_ep <- max(predicted_ep)
+snapshot_data <- final_shots2 %>%
+  mutate(predicted_ep = predicted_ep)
+
+shots4 <- shots3 %>%
+  select(court_zone, defender_distance, shot_distance, x, adjusted_y) %>%
+  mutate(predicted_ep = predicted_ep)
+
+
+
+ggplot(shots4, aes(x = x, y = adjusted_y, color = predicted_ep)) +
+  geom_point() +  # Set points to a single color
+  geom_vline(xintercept = seq(-250, 250, by = 25), color = "black", linetype = "dashed") +  # Vertical grid lines for X zones
+  geom_hline(yintercept = seq(0, 470, by = 25), color = "black", linetype = "dashed") +    # Horizontal grid lines for Y zones
+  labs(title = "Expected Points by Defender Distance, Shot Location Zone, Shot Distance", 
+       x = "Court X Coordinates", 
+       y = "Court Y Coordinates") +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "yellow", high = "red", midpoint = 1,  # Setting midpoint closer to where most values are around
+                        limits = c(0.5, 1.5))
+
+
+```
+
+```{r}
+shots5 <- shots4 %>%
+  group_by(court_zone) %>%
+  mutate(mean_ep = mean(predicted_ep)) %>%  # Added na.rm = TRUE to handle missing values
+  ungroup()
+
+
+
+ggplot(shots5, aes(x = x, y = adjusted_y, color = mean_ep)) +
+  geom_point() +  # Set points to a single color
+  geom_vline(xintercept = seq(-250, 250, by = 25), color = "black", linetype = "dashed") +  # Vertical grid lines for X zones
+  geom_hline(yintercept = seq(0, 470, by = 25), color = "black", linetype = "dashed") +    # Horizontal grid lines for Y zones
+  labs(title = "Scatter Plot with 25x25 Zone Outlines", 
+       x = "Court X Coordinates", 
+       y = "Court Y Coordinates") +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "yellow", high = "red", midpoint = 1,  # Setting midpoint closer to where most values are around
+                        limits = c(0.5, 1.5))
+
+
+```
+
+```{r}
+xgb.save(bst_final, "heliocentric_xg.model")
+```
+
