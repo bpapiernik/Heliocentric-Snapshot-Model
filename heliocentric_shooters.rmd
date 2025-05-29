@@ -1,0 +1,229 @@
+---
+title: "Heliocentric Visuals"
+author: "Brian Papiernik"
+date: "2025-03-06"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyverse)
+
+script_dir <- ""
+
+rda_files <- list.files(script_dir, pattern = "\\.rda$", full.names = TRUE)
+
+
+```
+
+```{r}
+
+temp <- data.frame()
+
+# Loop through each file and load it
+for (file_path in rda_files) {
+  
+  load(file_path)  # This loads `teammates_and_shooters`
+  
+
+  temp <- rbind(temp, teammates_and_shooter)
+
+}
+
+summary(temp)
+
+summary(shooters)
+summary(teammates)
+
+```
+
+```{r}
+shooters <- temp %>% filter(took_shot == "shooter")
+teammates <- temp %>% filter(took_shot == "teammates")
+
+# Get highest teammates' predicted_ep for each game_id.x and event_id
+max_teammates_ep <- teammates %>%
+  group_by(game_id.x, event_id) %>%
+  summarise(max_teammate_predicted_ep = max(predicted_ep, na.rm = TRUE), .groups = "drop")
+
+# Merge highest teammate predicted_ep with shooters
+shooters <- shooters %>%
+  left_join(max_teammates_ep, by = c("game_id.x", "event_id")) %>%
+  mutate(
+    heliocentric_value = predicted_ep - max_teammate_predicted_ep + .15,
+    good_decision = predicted_ep > max_teammate_predicted_ep + .02,
+    great_decision = predicted_ep > (max_teammate_predicted_ep + 0.08),
+    bad_decision = predicted_ep < max_teammate_predicted_ep - .05,
+    terrible_decision = predicted_ep < (max_teammate_predicted_ep - 0.15)
+  )
+
+# Count how many teammates had a higher predicted_ep than the shooter
+better_options_count <- teammates %>%
+  group_by(game_id.x, event_id) %>%
+  summarise(
+    better_options = sum(predicted_ep  > (shooters$predicted_ep[match(event_id, shooters$event_id)] + 0.1), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge with shooters
+shooters <- shooters %>%
+  left_join(better_options_count, by = c("game_id.x", "event_id"))
+
+# Summarize per player (ent)
+player_summary <- shooters %>%
+  group_by(ent) %>%
+  summarise(
+    total_shots = n(),
+    good_decision_count = sum(good_decision, na.rm = TRUE),
+    great_decision_count = sum(great_decision, na.rm = TRUE),
+    bad_decision_count = sum(bad_decision, na.rm = TRUE),
+    terrible_decision_count = sum(terrible_decision, na.rm = TRUE),
+    avg_heliocentric_value = mean(heliocentric_value, na.rm = TRUE),
+    total_heliocentric_value = sum(heliocentric_value, na.rm = TRUE),
+    total_better_options = sum(better_options, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# View the player summary
+print(player_summary)
+
+```
+
+
+```{r}
+# Split shooters and teammates
+avg_shooters <- temp %>% filter(took_shot == "shooter")
+avg_teammates <- temp %>% filter(took_shot == "teammates")
+
+# Get average teammates' predicted_ep for each game_id.x and event_id
+avg_teammates_ep <- avg_teammates %>%
+  group_by(game_id.x, event_id) %>%
+  summarise(avg_teammate_predicted_ep = mean(predicted_ep, na.rm = TRUE), .groups = "drop")
+
+# Merge average teammate predicted_ep with shooters
+
+avg_shooters <- avg_shooters %>%
+  left_join(avg_teammates_ep, by = c("game_id.x", "event_id")) %>%
+  mutate(
+    heliocentric_value = predicted_ep - avg_teammate_predicted_ep,
+    good_decision = predicted_ep > avg_teammate_predicted_ep,
+    great_decision = predicted_ep > (avg_teammate_predicted_ep + 0.15),
+    bad_decision = predicted_ep < avg_teammate_predicted_ep,
+    terrible_decision = predicted_ep < (avg_teammate_predicted_ep - 0.15)
+  )
+
+
+# Count how many teammates had a higher predicted_ep than the shooter
+better_options_count <- avg_teammates %>%
+  left_join(avg_shooters %>% select(game_id.x, event_id, shooter_pred_ep = predicted_ep), 
+            by = c("game_id.x", "event_id")) %>%
+  group_by(game_id.x, event_id) %>%
+  summarise(
+    better_options = sum(predicted_ep  > (avg_shooters$predicted_ep[match(event_id, avg_shooters$event_id)]), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge with avg_shooters
+avg_shooters <- avg_shooters %>%
+  left_join(better_options_count, by = c("game_id.x", "event_id"))
+
+# Summarize per player (ent)
+avg_player_summary <- avg_shooters %>%
+  group_by(ent) %>%
+  summarise(
+    total_shots = n(),
+    good_decision_count = sum(good_decision, na.rm = TRUE),
+    great_decision_count = sum(great_decision, na.rm = TRUE),
+    bad_decision_count = sum(bad_decision, na.rm = TRUE),
+    terrible_decision_count = sum(terrible_decision, na.rm = TRUE),
+    avg_heliocentric_value = mean(heliocentric_value, na.rm = TRUE),
+    total_heliocentric_value = sum(heliocentric_value, na.rm = TRUE),
+    total_better_options = sum(better_options, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# View the player summary
+print(avg_player_summary)
+
+
+```
+
+
+```{r}
+# Split shooters and teammates
+top_2_shooters <- temp %>% filter(took_shot == "shooter")
+top_2_teammates <- temp %>% filter(took_shot == "teammates")
+
+# Get the average of the top 2 teammates' predicted_ep for each game_id.x and event_id
+top_2_teammates_ep <- top_2_teammates %>%
+  group_by(game_id.x, event_id) %>%
+  arrange(desc(predicted_ep)) %>%  # Sort teammates by predicted_ep (highest first)
+  slice_head(n = 2) %>%  # Take the top 2 teammates
+  summarise(top_2_teammate_predicted_ep = mean(predicted_ep, na.rm = TRUE), .groups = "drop")
+
+# Merge the top 2 teammates' predicted_ep with shooters
+top_2_shooters <- top_2_shooters %>%
+  left_join(top_2_teammates_ep, by = c("game_id.x", "event_id")) %>%
+  mutate(
+    heliocentric_value = predicted_ep - top_2_teammate_predicted_ep,  # Small bias adjustment
+    good_decision = predicted_ep > top_2_teammate_predicted_ep,
+    great_decision = predicted_ep > (top_2_teammate_predicted_ep + .15),
+    bad_decision = predicted_ep < top_2_teammate_predicted_ep ,
+    terrible_decision = predicted_ep < (top_2_teammate_predicted_ep - 0.15)
+  )
+
+# Count how many teammates had a higher predicted_ep than the shooter
+better_options_count <- top_2_teammates %>%
+  left_join(top_2_shooters %>% select(game_id.x, event_id, shooter_pred_ep = predicted_ep), 
+            by = c("game_id.x", "event_id")) %>%
+  group_by(game_id.x, event_id) %>%
+  summarise(
+    better_options = sum(predicted_ep  > (top_2_shooters$predicted_ep[match(event_id, top_2_shooters$event_id)]), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ 
+# Merge with top_2_shooters
+top_2_shooters <- top_2_shooters %>%
+  left_join(better_options_count, by = c("game_id.x", "event_id"))
+
+# Summarize per player (ent)
+top_2_player_summary <- top_2_shooters %>%
+  group_by(ent) %>%
+  summarise(
+    total_shots = n(),
+    good_decision_count = sum(good_decision, na.rm = TRUE),
+    great_decision_count = sum(great_decision, na.rm = TRUE),
+    bad_decision_count = sum(bad_decision, na.rm = TRUE),
+    terrible_decision_count = sum(terrible_decision, na.rm = TRUE),
+    avg_heliocentric_value = mean(heliocentric_value, na.rm = TRUE),
+    total_heliocentric_value = sum(heliocentric_value, na.rm = TRUE),
+    total_better_options = sum(better_options, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# View the player summary
+print(top_2_player_summary)
+
+```
+
+
+
+
+
+```{r}
+test <- temp %>%
+  filter(game_id.x == "0021500663")
+
+ggplot(test, aes(x = x, y = y, color = predicted_ep, shape = as.factor(took_shot))) +
+  geom_point(size = 3) +  # Set points to a single color
+  geom_vline(xintercept = seq(-250, 250, by = 25), color = "black", linetype = "dashed") +  # Vertical grid lines for X zones
+  geom_hline(yintercept = seq(0, 470, by = 25), color = "black", linetype = "dashed") +    # Horizontal grid lines for Y zones
+  labs(title = "Scatter Plot with 25x25 Zone Outlines", 
+       x = "Court X Coordinates", 
+       y = "Court Y Coordinates") +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "yellow", high = "red", midpoint =1.25,  # Setting midpoint closer to where most values are around
+                        limits = c(0.5, 2.0))
+```
+
