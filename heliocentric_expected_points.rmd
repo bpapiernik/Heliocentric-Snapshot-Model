@@ -1,0 +1,447 @@
+---
+title: "Heliocentric PBP Link"
+author: "Brian Papiernik"
+date: "2025-03-05"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyverse)
+library(hoopR)
+library(xgboost)
+
+# Load the trained model
+heliocentric_xg.model <- xgb.load("heliocentric_xg.model")
+
+# Define directories
+script_dir <- ""
+output_dir <- ""
+dir.create(output_dir, showWarnings = FALSE)
+
+rda_files <- list.files(script_dir, pattern = "\\.rda$", full.names = TRUE)
+
+```
+
+
+```{r}
+# Function to calculate Euclidean distance
+calculate_distance <- function(x1, y1, x2, y2) {
+  sqrt((x1 - x2)^2 + (y1 - y2)^2)
+}
+
+# Function to find the closest defender for each offensive player
+find_closest_defender <- function(offensive_x, offensive_y, row, defensive_prefixes) {
+  distances <- sapply(defensive_prefixes, function(def_prefix) {
+    def_x <- as.numeric(row[[paste0(def_prefix, "_x")]])
+    def_y <- as.numeric(row[[paste0(def_prefix, "_y")]])
+    if (!is.na(def_x) && !is.na(def_y)) {
+      calculate_distance(offensive_x, offensive_y, def_x, def_y)
+    } else {
+      NA
+    }
+  })
+  
+  closest_defender_prefix <- names(which.min(distances))
+  closest_defender <- row[[paste0(closest_defender_prefix, "_ent")]]  # Get defender ID
+  closest_distance <- min(distances, na.rm = TRUE)  # Get the closest distance
+  
+  return(list(closest_defender = closest_defender, closest_distance = closest_distance))
+}
+
+# Function to update the dataset with closest defender info
+update_closest_defenders <- function(data) {
+  offensive_prefixes <- c("a1", "a2", "a3", "a4", "a5")
+  defensive_prefixes <- c("h1", "h2", "h3", "h4", "h5")
+  
+  for (i in 1:nrow(data)) {
+    row <- data[i, ]
+    offensive_team_id <- row[["player1_team_id"]]
+    
+    if (!is.na(offensive_team_id)) {
+      if (offensive_team_id == row[["a1_team"]]) {
+        offensive_prefixes <- c("a1", "a2", "a3", "a4", "a5")
+        defensive_prefixes <- c("h1", "h2", "h3", "h4", "h5")
+      } else {
+        offensive_prefixes <- c("h1", "h2", "h3", "h4", "h5")
+        defensive_prefixes <- c("a1", "a2", "a3", "a4", "a5")
+      }
+      
+      for (off_prefix in offensive_prefixes) {
+        off_x <- as.numeric(row[[paste0(off_prefix, "_x")]])
+        off_y <- as.numeric(row[[paste0(off_prefix, "_y")]])
+        if (!is.na(off_x) && !is.na(off_y)) {
+          closest_defender_info <- find_closest_defender(off_x, off_y, row, defensive_prefixes)
+          data[i, paste0(off_prefix, "_closest_defender")] <- closest_defender_info$closest_defender
+          data[i, paste0(off_prefix, "_closest_distance")] <- closest_defender_info$closest_distance
+        } else {
+          data[i, paste0(off_prefix, "_closest_defender")] <- NA
+          data[i, paste0(off_prefix, "_closest_distance")] <- NA
+        }
+      }
+    }
+  }
+  
+  return(data)
+}
+
+# Function to extract shooter information, rename columns, and keep event_id
+extract_shooter_info <- function(data, prefixes) {
+  shooter_data_list <- list()
+  
+  for (prefix in prefixes) {
+    matching_rows <- data %>% filter(!!sym(paste0(prefix, "_ent")) == player1_id)
+    
+    if (nrow(matching_rows) > 0) {
+      # Find all columns that belong to this prefix
+      relevant_cols <- grep(paste0("^", prefix, "_"), names(data), value = TRUE)
+
+      # Rename columns by removing the prefix
+      renamed_cols <- setNames(relevant_cols, gsub(paste0("^", prefix, "_"), "", relevant_cols))
+
+      # Select only the relevant columns and rename them
+      shooter_df <- matching_rows %>% 
+        select(game_id.x, event_id, all_of(relevant_cols)) %>% 
+        rename_with(~ gsub(paste0("^", prefix, "_"), "", .x), .cols = -c(game_id.x, event_id))
+      
+      shooter_data_list[[prefix]] <- shooter_df
+    }
+  }
+  
+  # Combine all shooter data into a single DataFrame
+  shooter_data <- bind_rows(shooter_data_list)
+
+  return(shooter_data)
+}
+
+
+# Function to extract shooter and their 4 teammates
+extract_shooter_and_teammates <- function(data, prefixes) {
+  shooter_data_list <- list()
+  
+  for (prefix in prefixes) {
+    # Filter shooter (player1_id == prefix_ent)
+    shooter_rows <- data %>% filter(!!sym(paste0(prefix, "_ent")) == player1_id)
+    
+    if (nrow(shooter_rows) > 0) {
+      # Identify the prefix team (either "a" or "h")
+      team_prefix <- substr(prefix, 1, 1)  # Extract "a" or "h"
+
+      # Identify the shooter's teammates (same team, but different player)
+      teammate_prefixes <- setdiff(prefixes[grepl(paste0("^", team_prefix), prefixes)], prefix)
+      
+      # Get shooter & teammate columns
+      relevant_cols <- c("game_id.x", "event_id", 
+                         grep(paste0("^", prefix, "_|", paste(teammate_prefixes, collapse = "_|"), "_"), 
+                              names(data), value = TRUE))
+
+      # Rename columns to remove prefix
+      renamed_cols <- setNames(relevant_cols, gsub(paste0("^", prefix, "_"), "", relevant_cols))
+
+      # Select and rename columns for shooter & teammates
+      shooter_df <- shooter_rows %>% 
+        select(all_of(relevant_cols)) %>% 
+        rename_with(~ gsub(paste0("^", prefix, "_"), "", .x), .cols = -c(game_id.x, event_id))
+      
+      shooter_data_list[[prefix]] <- shooter_df
+    }
+  }
+  
+  # Combine all shooter data into a single DataFrame
+  shooter_team_data <- bind_rows(shooter_data_list)
+
+  return(shooter_team_data)
+}
+
+# Function to extract and rename columns for a specific player
+extract_player_df <- function(data, prefix) {
+  relevant_cols <- grep(paste0("^", prefix, "_"), names(data), value = TRUE)  # Find all columns with prefix
+  relevant_cols <- c("game_id.x", "event_id", relevant_cols)  # Keep game_id and event_id
+  
+  # Rename columns to remove the prefix
+  renamed_cols <- setNames(relevant_cols, gsub(paste0("^", prefix, "_"), "", relevant_cols))
+  
+  # Extract and rename
+  player_df <- data %>%
+    select(all_of(relevant_cols)) %>%
+    rename_with(~ gsub(paste0("^", prefix, "_"), "", .x), .cols = -c("game_id.x", "event_id")) %>%
+    mutate(player_id = prefix)  # Add a column to track player role
+  
+  return(player_df)
+}
+
+get_defensive_prefixes <- function(row) {
+  if (!is.na(row[["player1_team_id"]]) && row[["player1_team_id"]] == row[["a1_team"]]) {
+    return(c("h1", "h2", "h3", "h4", "h5"))
+  } else {
+    return(c("a1", "a2", "a3", "a4", "a5"))
+  }
+}
+
+
+```
+
+
+```{r}
+for (file_path in rda_files) {
+  
+  # Load tracking data
+  load(file_path)
+  
+  # Extract game_id from filename
+  game_id <- gsub(".*?/heliocentric/(\\d+)_processed\\.rda", "\\1", file_path)
+  tracking$game_id <- game_id
+  
+  # Load play-by-play data
+  pbp <- nba_pbp(game_id = game_id) %>%
+    mutate(game_clock = (minute_remaining_quarter * 60) + seconds_remaining_quarter,
+           event_num = as.numeric(event_num)) %>%
+    filter(event_type == 1) # Filter for missed shots (Event_type = 2) then we rerun the code for made (Event_type = 1)
+  
+   # Merge tracking with play-by-play
+  
+  merged_data <- inner_join(tracking, pbp, by = c("event_id" = "event_num"))
+  
+  merged_data <- merged_data %>%
+    mutate(game_clock.x = game_clock.x -1.5) %>%
+    filter(!is.na(a1_x))
+
+  merged_data_filtered <- merged_data %>%
+    group_by(quarter, event_id) %>%  # Group by identifying columns
+    slice_min(abs(game_clock.x - game_clock.y), n = 1, with_ties = FALSE) %>%  # Select closest match, no ties
+    ungroup()
+  
+  # Define player prefixes
+  player_prefixes <- c("a1", "a2", "a3", "a4", "a5", "h1", "h2", "h3", "h4", "h5")
+
+# Create closest defender and distance columns for each player
+  for (prefix in player_prefixes) {
+    merged_data_filtered[[paste0(prefix, "_closest_defender")]] <- NA
+    merged_data_filtered[[paste0(prefix, "_closest_distance")]] <- NA
+  }
+  
+  merged_data_filtered2 <- merged_data_filtered %>%
+    mutate(across(matches("_closest_(defender|distance)$"), ~ NA))
+
+  # Assign closest defenders
+  merged_data_filtered2 <- update_closest_defenders(merged_data_filtered2)
+  
+  # Define hoop coordinates
+  hoop_x <- 0
+  hoop_y <- 53
+  
+   # Player prefixes
+  player_prefixes <- c("a1", "a2", "a3", "a4", "a5", "h1", "h2", "h3", "h4", "h5")
+  
+  # Ensure player prefix columns exist before applying across()
+  for (prefix in player_prefixes) {
+    if (!prefix %in% names(merged_data_filtered2)) {
+      merged_data_filtered2[[prefix]] <- NA_real_  # Create column if missing
+    }
+  }
+
+  merged_data_filtered3 <- merged_data_filtered2 %>%
+    rowwise() %>%
+    mutate(across(
+      .cols = all_of(player_prefixes),
+      .fns = list(distance_from_hoop = ~ {
+        # Extract the player’s x and y positions correctly per row
+        player_x <- get(paste0(cur_column(), "_x"), envir = as.environment(cur_data()))
+        player_y <- get(paste0(cur_column(), "_y"), envir = as.environment(cur_data()))
+      
+      # Compute distance
+        if (!is.na(player_x) && !is.na(player_y)) {
+          calculate_distance(player_x, player_y, hoop_x, hoop_y)
+        } else {
+          NA_real_
+        }
+      }),
+      .names = "{col}_distance_from_hoop"
+    )) %>%
+    ungroup()
+      
+  
+  # Apply function to extract shooter info
+  shooter <- extract_shooter_info(merged_data_filtered3, player_prefixes)
+  
+# Step 2: Create 25x25 square foot zones for X and Y
+# Divide X into 20 zones (since X goes from -250 to 250)
+  x_breaks <- seq(-250, 250, by = 25)  # X zones: 20 zones, each 25 feet wide
+# Divide Y into 19 zones (since Y goes from 0 to 470)
+  y_breaks <- seq(0, 521, by = 25)     # Y zones: 19 zones, each 25 feet tall
+
+# Step 3: Assign X and Y zones to each shot and combine them into a single zone label
+  shooter <- shooter %>%
+  mutate(
+    x_zone = as.numeric(cut(x, breaks = x_breaks, labels = FALSE, include.lowest = TRUE)),
+    y_zone = as.numeric(cut(y, breaks = y_breaks, labels = FALSE, include.lowest = TRUE)),
+    x_zone = ifelse(is.na(x_zone), 10, x_zone),  # Default value for NA zones
+    y_zone = ifelse(is.na(y_zone), 21, y_zone),  # Default value for NA zones
+    court_zone = paste0(x_zone, "0", y_zone)  # Proper concatenation
+  )
+
+  
+  shooter <- shooter %>%
+  mutate(took_shot = "shooter")
+  
+  final_shooter <- shooter %>%
+  mutate(defender_distance = closest_distance, #adjusted for pass time (3 ft)
+         court_zone = as.numeric(court_zone)) %>% 
+  select(event_id, ent, distance_from_hoop, defender_distance, court_zone) %>%
+  rename(shot_distance = distance_from_hoop)
+
+
+
+# Ensure final_shooter is a dataframe
+  final_shooter <- as.data.frame(final_shooter)
+
+# Convert newdata to matrix
+  newdata_matrix <- as.matrix(final_shooter[, 3:5]) 
+  
+  predicted_ep <- predict(heliocentric_xg.model, newdata = newdata_matrix)
+  
+  shooter_snapshot_data <- shooter %>%
+  mutate(predicted_ep = predicted_ep) %>%
+    select(game_id.x, event_id, team, ent, x, y, closest_defender, closest_distance, distance_from_hoop, predicted_ep, took_shot)
+  
+  
+  # Apply function to extract shooter and teammates
+  teammates <- extract_shooter_and_teammates(merged_data_filtered3, player_prefixes)
+  
+  player_prefixes <- c("a1", "a2", "a3", "a4", "a5", "h1", "h2", "h3", "h4", "h5")
+  
+  # Extract data for each player
+  a1_df <- extract_player_df(teammates, "a1")
+  a1_df <- a1_df %>%
+  filter(!is.na(x))
+
+  a2_df <- extract_player_df(teammates, "a2")
+  a2_df <- a2_df %>%
+    filter(!is.na(x))
+
+  a3_df <- extract_player_df(teammates, "a3")
+  a3_df <- a3_df %>%
+    filter(!is.na(x))
+
+  a4_df <- extract_player_df(teammates, "a4")
+  a4_df <- a4_df %>%
+    filter(!is.na(x))
+
+  a5_df <- extract_player_df(teammates, "a5")
+  a5_df <- a5_df %>%
+    filter(!is.na(x))
+
+  h1_df <- extract_player_df(teammates, "h1")
+  h1_df <- h1_df %>%
+    filter(!is.na(x))
+
+  h2_df <- extract_player_df(teammates, "h2")
+  h2_df <- h2_df %>%
+    filter(!is.na(x))
+
+  h3_df <- extract_player_df(teammates, "h3")
+  h3_df <- h3_df %>%
+    filter(!is.na(x))
+
+  h4_df <- extract_player_df(teammates, "h4")
+  h4_df <- h4_df %>%
+    filter(!is.na(x))
+
+  h5_df <- extract_player_df(teammates, "h5")
+  h5_df <- h5_df %>%
+    filter(!is.na(x))
+
+  teammates_df <- rbind(a1_df, a2_df, a3_df, a4_df, a5_df, 
+                        h1_df, h2_df, h3_df, h4_df, h5_df)
+  teammates_df <- teammates_df %>%
+  mutate(took_shot = "teammates")
+  
+  x_breaks <- seq(-250, 250, by = 25)  
+  y_breaks <- seq(0, 521, by = 25)     
+
+# Step 3: Assign X and Y zones to each shot and combine them into a single zone label
+  teammates_df <- teammates_df %>%
+    mutate(
+      x_zone = as.numeric(cut(x, breaks = x_breaks, labels = FALSE, include.lowest = TRUE)),
+      y_zone = as.numeric(cut(y, breaks = y_breaks, labels = FALSE, include.lowest = TRUE)),
+      x_zone = ifelse(is.na(x_zone), 10, x_zone),  # Default value for NA zones
+      y_zone = ifelse(is.na(y_zone), 21, y_zone),  # Default value for NA zones
+      court_zone = paste0(x_zone, "0", y_zone)  # Proper concatenation
+  )
+  
+  final_teammates <- teammates_df %>%
+    mutate(defender_distance = abs(closest_distance) - 15 , #adjusted for pass time (3 ft)
+         court_zone = as.numeric(court_zone)) %>% 
+    select(event_id, ent, distance_from_hoop, defender_distance, court_zone) %>%
+    rename(shot_distance = distance_from_hoop)
+  
+  
+  
+  final_teammates <- as.data.frame(final_teammates)
+
+# Convert newdata to matrix
+  newdata_matrix <- as.matrix(final_teammates[, 3:5]) 
+
+  predicted_ep <- predict(heliocentric_xg.model, newdata = newdata_matrix)
+
+  teammates_snapshot_data <- teammates_df %>%
+    mutate(predicted_ep = predicted_ep) %>%
+    select(game_id.x, event_id, team, ent, x, y, closest_defender, closest_distance, distance_from_hoop, predicted_ep,
+           took_shot)
+
+  teammates_and_shooter <- rbind(shooter_snapshot_data, teammates_snapshot_data)
+  
+  teammates_and_shooter <- teammates_and_shooter %>%
+    mutate(make_or_miss = "make")
+  
+  defenders_df_list <- vector("list", nrow(merged_data_filtered3))
+
+  for (i in seq_len(nrow(merged_data_filtered3))) {
+    row <- merged_data_filtered3[i, ]
+    defensive_prefixes <- get_defensive_prefixes(row)
+  
+    defenders_row_list <- lapply(defensive_prefixes, function(prefix) {
+      df <- extract_player_df(row, prefix)
+      df <- df %>% filter(!is.na(x))
+      return(df)
+    })
+
+  defenders_df_list[[i]] <- bind_rows(defenders_row_list)
+}
+
+# Combine all defenders from all possessions
+defenders_df <- bind_rows(defenders_df_list)
+
+# Add tagging and NA fields
+defenders_snapshot_data <- defenders_df %>%
+  mutate(
+    took_shot = "defenders",
+    x_zone = as.numeric(cut(x, breaks = x_breaks, labels = FALSE, include.lowest = TRUE)),
+    y_zone = as.numeric(cut(y, breaks = y_breaks, labels = FALSE, include.lowest = TRUE)),
+    x_zone = ifelse(is.na(x_zone), 10, x_zone),
+    y_zone = ifelse(is.na(y_zone), 21, y_zone),
+    court_zone = paste0(x_zone, "0", y_zone),
+    closest_defender = NA_real_,
+    closest_distance = NA_real_,
+    distance_from_hoop = NA_real_,
+    predicted_ep = NA_real_,
+    make_or_miss = "make"
+  ) %>%
+  select(game_id.x, event_id, team, ent, x, y, closest_defender, closest_distance, distance_from_hoop, predicted_ep, took_shot, make_or_miss)
+
+
+full_snapshot <- bind_rows(teammates_and_shooter, defenders_snapshot_data)
+
+# Save the full possession snapshot
+output_file <- file.path(output_dir, paste0(game_id, "_full_snapshot_makes.rda"))  # or _makes
+save(full_snapshot, file = output_file)
+  
+  print(paste("Saved:", output_file))
+}
+
+
+  
+  
+```
+
+
