@@ -1,0 +1,138 @@
+---
+title: "Untitled"
+author: "Brian Papiernik"
+date: "2024-08-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(dplyr)
+library(tidyverse)
+
+# load("")
+# head(tracking)
+# summary(tracking)
+
+script_dir <- ""
+rda_files <- list.files(script_dir, pattern = "\\.rda$", full.names = TRUE)
+
+
+
+```
+
+
+```{r}
+# Function to flip and transform the coordinates for the ball and players
+flip_and_transform_coordinates <- function(event_data, player_prefixes) {
+  # Transform ball coordinates (x and y)
+  original_ball_x <- event_data$x
+  original_ball_y <- event_data$y
+
+  # Flip and transform ball coordinates
+  event_data$x <- original_ball_y * 10  # Flip y to x and multiply by 10
+  event_data$y <- original_ball_x * 10  # Flip x to y and multiply by 10
+  event_data$x <- event_data$x - 250    # Subtract 250 from the new x
+
+  # Transform player coordinates
+  for (prefix in player_prefixes) {
+    # Store original coordinates for each player
+    original_x <- event_data[[paste0(prefix, "_x")]]
+    original_y <- event_data[[paste0(prefix, "_y")]]
+
+    # Flip and transform the coordinates
+    new_x <- original_y * 10  # Flip y to x and multiply by 10
+    new_y <- original_x * 10  # Flip x to y and multiply by 10
+
+    event_data[[paste0(prefix, "_x")]] <- new_x - 250  # Apply the transformation to the player's x
+    event_data[[paste0(prefix, "_y")]] <- new_y        # Apply the transformation to the player's y
+  }
+
+  return(event_data)
+}
+
+convert_to_half_court <- function(event_data, player_prefixes) {
+  # Loop through each row to check and convert ball and player coordinates
+  for (i in 1:nrow(event_data)) {
+    # Check if ball y is not NA and if y > 470 for the current row
+    if (!is.na(event_data$y[i]) && event_data$y[i] > 470) {
+      event_data$x[i] <- -event_data$x[i]            # Flip x by multiplying by -1
+      event_data$y[i] <- 940 - event_data$y[i]       # Convert y to reference 940 as the baseline
+    }
+    
+    # Convert player coordinates for those on the far side (y > 470)
+    for (prefix in player_prefixes) {
+      player_y <- event_data[[paste0(prefix, "_y")]][i]
+      
+      # Check if player_y is not NA and if y > 470
+      if (!is.na(player_y) && player_y > 470) {
+        # Flip and adjust player x and y coordinates
+        event_data[[paste0(prefix, "_x")]][i] <- -event_data[[paste0(prefix, "_x")]][i]  # Flip x
+        event_data[[paste0(prefix, "_y")]][i] <- 940 - player_y  # Adjust y
+      }
+    }
+  }
+  
+  return(event_data)
+}
+
+
+# Define the calculate_distance function with error handling for non-numeric values and NA
+calculate_distance <- function(x1, y1, x2, y2) {
+  x1 <- as.numeric(x1)
+  y1 <- as.numeric(y1)
+  x2 <- as.numeric(x2)
+  y2 <- as.numeric(y2)
+  if (any(is.na(c(x1, y1, x2, y2)))) {
+    return(NA)
+  } else {
+    return(sqrt((x2 - x1)^2 + (y2 - y1)^2))
+  }
+}
+
+
+```
+
+
+
+
+```{r}
+# Define all player prefixes
+player_prefixes <- c("a1", "a2", "a3", "a4", "a5", "h1", "h2", "h3", "h4", "h5")
+
+# Process each RDA file and apply conversions and calculations
+for (rda_file in rda_files) {
+  load(rda_file)
+  ids <- unique(tracking$event_id)
+  event_data_list <- list()
+  print(rda_file)
+  
+  for (j in ids) {
+    event_data <- tracking %>% filter(event_id == j)
+    
+    # Step 1: Apply the first transformation (flip and scale)
+    event_data <- flip_and_transform_coordinates(event_data, player_prefixes)
+    
+    # Step 2: Apply the half-court conversion
+    event_data <- convert_to_half_court(event_data, player_prefixes)
+    
+    
+    
+    # Store modified data
+    event_data_list[[as.character(j)]] <- event_data
+  }
+  
+  # Bind all events back together and save the processed data
+  tracking <- bind_rows(event_data_list)
+  save(tracking, file = sub(".rda$", "_processed.rda", rda_file))
+  
+}
+
+
+```
+
+
